@@ -1,0 +1,18 @@
+#!/usr/bin/make -f
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 The Blueberry Pie OS Authors
+
+include /usr/share/pietoolchain/rules.mk
+
+$(OBJ)/init.o: $(SRCROOT)/init.c
+	@mkdir -p $(OBJ)
+	$(CC) $(BASE_CFLAGS) -c $< -o $@
+
+$(OBJ)/init: $(OBJ)/init.o
+	$(CC) $(BASE_LDFLAGS) $< -lbsm -o $@
+
+install: $(OBJ)/init
+	install -d $(ROOT)/sbin
+	install -m 755 $(OBJ)/init $(ROOT)/sbin/launchd
+
+.PHONY: install

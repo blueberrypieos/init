@@ -1,0 +1,19 @@
+Source: init
+Section: admin
+Priority: optional
+Maintainer: Maxwell <maxwell@blueberrypieos.com>
+Build-Depends: pietoolchain (>= 0.1.0)
+Standards-Version: 4.7.3
+Homepage: https://github.com/blueberrypieos/init
+Vcs-Git: https://github.com/blueberrypieos/init.git
+Vcs-Browser: https://github.com/blueberrypieos/init
+Rules-Requires-Root: no
+
+Package: blueberry-pie-os-init
+Architecture: darwin-arm64
+Essential: yes
+Priority: required
+Depends: libbsm, libsystem
+Description: the init process (/sbin/launchd)
+ init.c, a small init that is also the bootstrap server, installed as
+ /sbin/launchd. It runs /etc/rc, then keeps a root shell on the console.
