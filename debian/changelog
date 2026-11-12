@@ -1,3 +1,11 @@
+init (3) blueberry-pie-os; urgency=medium
+
+  * Before a reboot or halt, init runs /etc/rc.shutdown, for 30 seconds at
+    most, while it still serves the bootstrap port.
+  * The first reboot or halt request decides which one happens.
+
+ -- Maxwell <maxwell@blueberrypieos.com>  Thu, 12 Nov 2026 21:16:19 +0000
+
 init (2) blueberry-pie-os; urgency=medium
 
   * Start getty on the console in place of a root shell.

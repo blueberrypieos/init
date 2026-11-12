@@ -17,4 +17,5 @@ Depends: libbsm, libsystem
 Description: the init process (/sbin/launchd)
  init.c, a small init that is also the bootstrap server, installed as
  /sbin/launchd. It runs /etc/rc, then keeps getty on the console.
+ It runs /etc/rc.shutdown before a reboot or halt.
  It falls back to a root shell if getty or login is unavailable.

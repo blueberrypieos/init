@@ -20,6 +20,9 @@
  *     checks in com.apple.auditd, the kernel's audit control port;
  *   - runs /etc/rc (with /bin/sh), then keeps getty on the console,
  *     starting a new one when it exits, or a root shell without login;
+ *   - on a reboot or halt, runs /etc/rc.shutdown (with /bin/sh) while it
+ *     still serves the bootstrap port, for RC_SHUTDOWN_WAIT seconds at
+ *     most, then stops every process;
  *   - reaps every orphaned process.
  *
  * xnu lets no process signal init, so reboot(8) and shutdown(8) ask it
@@ -52,21 +55,23 @@
 #include <unistd.h>
 #include <pie/bootstrap.h>
 
-#define SHELL     "/bin/sh"
-#define RC        "/etc/rc"
-#define GETTY     "/usr/libexec/getty"
-#define LOGIN     "/usr/bin/login"
-#define CONSOLE   _PATH_CONSOLE
-#define ROOT_HOME "/var/root"
-#define PATH      "/usr/bin:/bin:/usr/sbin:/sbin"
+#define SHELL            "/bin/sh"
+#define RC               "/etc/rc"
+#define RC_SHUTDOWN      "/etc/rc.shutdown"
+#define RC_SHUTDOWN_WAIT 30
+#define GETTY            "/usr/libexec/getty"
+#define LOGIN            "/usr/bin/login"
+#define CONSOLE          _PATH_CONSOLE
+#define ROOT_HOME        "/var/root"
+#define PATH             "/usr/bin:/bin:/usr/sbin:/sbin"
 
 static int shutdown_how = -1;         /* RB_* once a reboot or halt is asked for */
-static pid_t rc_pid, console_pid;
+static pid_t rc_pid, console_pid, rc_shutdown_pid;
 static mach_port_t bs_port;
 static mach_port_t bs_notify;           /* dead-name notifications; no one else can send here */
 static int kq;
 
-enum { TIMER_CONSOLE = 1 };
+enum { TIMER_CONSOLE = 1, TIMER_RC_SHUTDOWN };
 
 static void
 say(const char *fmt, ...)
@@ -246,6 +251,12 @@ reap(void)
 			}
 			if (shutdown_how < 0) {
 				start_console();
+			}
+		} else if (pid == rc_shutdown_pid) {
+			rc_shutdown_pid = 0;
+			if (status != 0) {
+				say("%s exited with status %d", RC_SHUTDOWN,
+				    WIFEXITED(status) ? WEXITSTATUS(status) : -1);
 			}
 		} else if (pid == console_pid) {
 			console_pid = 0;
@@ -608,7 +619,7 @@ bs_handle(pie_bs_request_buffer_t *in)
 	case PIE_BS_REBOOT:
 		if (euid != 0) {
 			rep.ret = BOOTSTRAP_NOT_PRIVILEGED;
-		} else {
+		} else if (shutdown_how < 0) {
 			shutdown_how = (req->arg & RB_HALT) ? RB_HALT : RB_AUTOBOOT;
 		}
 		break;
@@ -662,6 +673,27 @@ bs_drain(void)
 }
 
 /* --- shutting down ------------------------------------------------------------------ */
+
+/* Start /etc/rc.shutdown, if there is one, and the timer that ends the wait for it. */
+static void
+start_rc_shutdown(void)
+{
+	if (access(RC_SHUTDOWN, R_OK) != 0) {
+		return;
+	}
+	char *argv[] = { "sh", RC_SHUTDOWN, shutdown_how == RB_HALT ? "halt" : "reboot", NULL };
+	pid_t pid = spawn_on_console("/", SHELL, argv, 0);
+	if (pid <= 0) {
+		return;
+	}
+	struct kevent ev;
+	EV_SET(&ev, TIMER_RC_SHUTDOWN, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_SECONDS, RC_SHUTDOWN_WAIT, NULL);
+	if (kevent(kq, &ev, 1, NULL, 0, NULL) != 0) {
+		say("cannot time %s: %s", RC_SHUTDOWN, strerror(errno));
+		return;
+	}
+	rc_shutdown_pid = pid;
+}
 
 static void
 shutdown_system(void)
@@ -730,7 +762,16 @@ main(void)
 		start_console();
 	}
 
-	while (shutdown_how < 0) {
+	/* Once a reboot or halt is asked for, serve on until /etc/rc.shutdown is done. */
+	bool stopping = false;
+	for (;;) {
+		if (shutdown_how >= 0 && !stopping) {
+			stopping = true;
+			start_rc_shutdown();
+		}
+		if (stopping && rc_shutdown_pid == 0) {
+			break;
+		}
 		struct kevent out[8];
 		int n = kevent(kq, NULL, 0, out, 8, NULL);
 		for (int i = 0; i < n; i++) {
@@ -745,13 +786,16 @@ main(void)
 			case EVFILT_SIGNAL:
 				if (out[i].ident == SIGCHLD) {
 					reap();
-				} else {
+				} else if (shutdown_how < 0) {
 					shutdown_how = out[i].ident == SIGUSR2 ? RB_HALT : RB_AUTOBOOT;
 				}
 				break;
 			case EVFILT_TIMER:
-				if (out[i].ident == TIMER_CONSOLE && console_pid == 0) {
+				if (out[i].ident == TIMER_CONSOLE && console_pid == 0 && shutdown_how < 0) {
 					start_console();
+				} else if (out[i].ident == TIMER_RC_SHUTDOWN && rc_shutdown_pid != 0) {
+					say("%s still running after %d seconds", RC_SHUTDOWN, RC_SHUTDOWN_WAIT);
+					rc_shutdown_pid = 0;
 				}
 				break;
 			}
