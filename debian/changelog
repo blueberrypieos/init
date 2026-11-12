@@ -1,8 +1,14 @@
 init (2) blueberry-pie-os; urgency=medium
 
   * Start getty on the console in place of a root shell.
+  * Only root may check in or register a system service name.
+  * Bootstrap requests need a send-once reply port and a send right.
+  * A console that fails to start is tried again a second later.
+  * init makes the port of com.apple.auditd at boot and sets it as the
+    host's audit control port. auditd checks it in. Only root may check it in,
+    and no one may look it up.
 
- -- Maxwell <maxwell@blueberrypieos.com>  Tue, 10 Nov 2026 00:35:22 +0000
+ -- Maxwell <maxwell@blueberrypieos.com>  Wed, 11 Nov 2026 22:28:13 +0000
 
 init (1) blueberry-pie-os; urgency=medium
 

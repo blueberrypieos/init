@@ -10,9 +10,14 @@
  *   - serves the task bootstrap port that every process inherits: services
  *     check in, look up and register by name, and root can ask for a
  *     reboot or halt (the protocol of <pie/bootstrap.h>, which libxpc's
- *     bootstrap_* calls and reboot3() speak); a name is forgotten once its
- *     service's port dies (its owner exited), so that it can be checked
- *     in again and names made up at run time do not pile up;
+ *     bootstrap_* calls and reboot3() speak); only root may serve a
+ *     system name, one that starts with SYSTEM_PREFIX, or a host port
+ *     name; a name is forgotten once its service's port dies (its owner
+ *     exited), so that it can be checked in again and names made up at
+ *     run time do not pile up;
+ *   - makes the ports of the host port names at boot and sets them as the
+ *     host's special ports, as launchd's HostSpecialPort does: auditd
+ *     checks in com.apple.auditd, the kernel's audit control port;
  *   - runs /etc/rc (with /bin/sh), then keeps getty on the console,
  *     starting a new one when it exits, or a root shell without login;
  *   - reaps every orphaned process.
@@ -25,6 +30,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <hfs/hfs_mount.h>
+#include <mach/host_special_ports.h>
 #include <mach/mach.h>
 #include <mach/notify.h>
 #include <paths.h>
@@ -188,6 +194,8 @@ spawn_on_console(const char *dir, const char *path, char *const argv[], int ofla
 	_exit(127);
 }
 
+static void restart_console_later(void);
+
 static void
 start_console(void)
 {
@@ -211,6 +219,7 @@ start_console(void)
 	console_pid = spawn_on_console(ROOT_HOME, path, argv, O_POPUP);
 	if (console_pid < 0) {
 		console_pid = 0;
+		restart_console_later();
 	}
 }
 
@@ -251,13 +260,35 @@ reap(void)
 /* --- the bootstrap server ----------------------------------------------------------- */
 
 /*
- * A name's service. A name is made on demand: its first look-up or check-in
- * makes a port, whose receive right init keeps (messages queue there) until
- * the service checks in and takes it. Once the receive right is the
- * service's, or a send right was registered, init asks for a dead-name
+ * A name's service. A name is made by its first check-in or register. A
+ * check-in makes a port and hands its receive right to the service in the
+ * reply; a register gives init a send right to the service's own port. A
+ * look-up only finds a name and never makes one. Once the receive right is
+ * the service's, or a send right was registered, init asks for a dead-name
  * notification on its send right: when the port dies (the process holding
  * the receive right exited), the name is forgotten.
+ *
+ * Clients trust whoever serves a system name, so only a sender whose audit
+ * token has euid 0 may check one in or register one.
  */
+#define SYSTEM_PREFIX "com.apple.system."
+
+/*
+ * Names whose port is also a host special port. Only the kernel and init may
+ * set one, so init makes the port: at boot, and again for a check-in once the
+ * previous port has died. The kernel can send to it before the service checks
+ * in. Only root may check one in. None may be registered, as the host's
+ * special port would stay the old one, and none may be looked up: its
+ * service may not check who sends to it, and root reaches it as the host
+ * special port.
+ */
+static const struct {
+	const char *name;
+	int id;
+} host_ports[] = {
+	{ "com.apple.auditd", HOST_AUDIT_CONTROL_PORT },
+};
+
 struct service {
 	struct service *next;
 	name_t name;
@@ -265,6 +296,23 @@ struct service {
 	mach_port_t recv;       /* its receive right, until the service checks in */
 };
 static struct service *services;
+
+static int
+host_port_id(const char *name)
+{
+	for (size_t i = 0; i < sizeof(host_ports) / sizeof(host_ports[0]); i++) {
+		if (strcmp(name, host_ports[i].name) == 0) {
+			return host_ports[i].id;
+		}
+	}
+	return 0;
+}
+
+static bool
+privileged_name(const char *name)
+{
+	return strncmp(name, SYSTEM_PREFIX, sizeof(SYSTEM_PREFIX) - 1) == 0 || host_port_id(name) != 0;
+}
 
 static struct service *
 find_service(const char *name)
@@ -288,6 +336,32 @@ new_service(const char *name)
 	s->next = services;
 	services = s;
 	return s;
+}
+
+/*
+ * Make a service's port, for its check-in: the receive right and our send
+ * right under one name. A host port name's port becomes that host special port.
+ */
+static kern_return_t
+new_port(struct service *s)
+{
+	mach_port_t self = mach_task_self(), port;
+	kern_return_t kr = mach_port_allocate(self, MACH_PORT_RIGHT_RECEIVE, &port);
+	if (kr != KERN_SUCCESS) {
+		return kr;
+	}
+	mach_port_insert_right(self, port, port, MACH_MSG_TYPE_MAKE_SEND);
+	s->send = s->recv = port;
+	int id = host_port_id(s->name);
+	if (id != 0) {
+		mach_port_t host = mach_host_self();
+		kr = host_set_special_port(host, id, port);
+		mach_port_deallocate(self, host);
+		if (kr != KERN_SUCCESS) {
+			say("cannot set host port %d for %s: %s", id, s->name, mach_error_string(kr));
+		}
+	}
+	return KERN_SUCCESS;
 }
 
 /* Forget a service: unlink it and drop our right to its port. */
@@ -430,6 +504,13 @@ bs_setup(void)
 		bs_notify = MACH_PORT_NULL;
 	}
 	kevent(kq, ev, n, NULL, 0, NULL);
+
+	for (size_t i = 0; i < sizeof(host_ports) / sizeof(host_ports[0]); i++) {
+		struct service *s = new_service(host_ports[i].name);
+		if (s == NULL || new_port(s) != KERN_SUCCESS) {
+			say("cannot make the port of %s", host_ports[i].name);
+		}
+	}
 }
 
 static void
@@ -440,7 +521,9 @@ bs_handle(pie_bs_request_buffer_t *in)
 	mach_port_t self = mach_task_self();
 
 	if (req->head.msgh_size != sizeof(*req) || !(req->head.msgh_bits & MACH_MSGH_BITS_COMPLEX) ||
-	    req->body.msgh_descriptor_count != 1 || req->port.type != MACH_MSG_PORT_DESCRIPTOR) {
+	    MACH_MSGH_BITS_REMOTE(req->head.msgh_bits) != MACH_MSG_TYPE_PORT_SEND_ONCE ||
+	    req->body.msgh_descriptor_count != 1 || req->port.type != MACH_MSG_PORT_DESCRIPTOR ||
+	    (MACH_PORT_VALID(req->port.name) && req->port.disposition != MACH_MSG_TYPE_PORT_SEND)) {
 		mach_msg_destroy(&req->head);
 		return;
 	}
@@ -473,15 +556,13 @@ bs_handle(pie_bs_request_buffer_t *in)
 	struct service *watch = NULL;   /* a service to watch once the reply has gone */
 	switch (req->head.msgh_id) {
 	case PIE_BS_CHECK_IN:
-		if (s == NULL) {
-			mach_port_t port;
-			if ((s = new_service(req->name)) == NULL ||
-			    mach_port_allocate(self, MACH_PORT_RIGHT_RECEIVE, &port) != KERN_SUCCESS) {
-				rep.ret = BOOTSTRAP_NO_MEMORY;
-				break;
-			}
-			mach_port_insert_right(self, port, port, MACH_MSG_TYPE_MAKE_SEND);
-			s->send = s->recv = port;
+		if (euid != 0 && privileged_name(req->name)) {
+			rep.ret = BOOTSTRAP_NOT_PRIVILEGED;
+			break;
+		}
+		if (s == NULL && ((s = new_service(req->name)) == NULL || new_port(s) != KERN_SUCCESS)) {
+			rep.ret = BOOTSTRAP_NO_MEMORY;
+			break;
 		}
 		if (s->recv == MACH_PORT_NULL) {
 			rep.ret = BOOTSTRAP_SERVICE_ACTIVE;
@@ -493,14 +574,17 @@ bs_handle(pie_bs_request_buffer_t *in)
 		}
 		break;
 	case PIE_BS_LOOK_UP:
-		if (s == NULL || !MACH_PORT_VALID(s->send)) {
+		if (host_port_id(req->name) != 0) {
+			rep.ret = BOOTSTRAP_NOT_PRIVILEGED;
+		} else if (s == NULL || !MACH_PORT_VALID(s->send)) {
 			rep.ret = BOOTSTRAP_UNKNOWN_SERVICE;
 		} else {
 			rep.port.name = s->send;
 		}
 		break;
 	case PIE_BS_REGISTER:
-		if (!MACH_PORT_VALID(passed)) {
+		if (!MACH_PORT_VALID(passed) || (euid != 0 && privileged_name(req->name)) ||
+		    host_port_id(req->name) != 0) {
 			rep.ret = BOOTSTRAP_NOT_PRIVILEGED;
 		} else if (s != NULL && s->recv == MACH_PORT_NULL && euid != 0) {
 			/* Only root replaces a service that has checked in. */
