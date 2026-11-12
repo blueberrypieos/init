@@ -13,8 +13,8 @@
  *     bootstrap_* calls and reboot3() speak); a name is forgotten once its
  *     service's port dies (its owner exited), so that it can be checked
  *     in again and names made up at run time do not pile up;
- *   - runs /etc/rc (with /bin/sh), then keeps a root shell on the console,
- *     starting a new one when it exits;
+ *   - runs /etc/rc (with /bin/sh), then keeps getty on the console,
+ *     starting a new one when it exits, or a root shell without login;
  *   - reaps every orphaned process.
  *
  * xnu lets no process signal init, so reboot(8) and shutdown(8) ask it
@@ -48,17 +48,19 @@
 
 #define SHELL     "/bin/sh"
 #define RC        "/etc/rc"
+#define GETTY     "/usr/libexec/getty"
+#define LOGIN     "/usr/bin/login"
 #define CONSOLE   _PATH_CONSOLE
 #define ROOT_HOME "/var/root"
 #define PATH      "/usr/bin:/bin:/usr/sbin:/sbin"
 
 static int shutdown_how = -1;         /* RB_* once a reboot or halt is asked for */
-static pid_t rc_pid, shell_pid;
+static pid_t rc_pid, console_pid;
 static mach_port_t bs_port;
 static mach_port_t bs_notify;           /* dead-name notifications; no one else can send here */
 static int kq;
 
-enum { TIMER_SHELL = 1 };
+enum { TIMER_CONSOLE = 1 };
 
 static void
 say(const char *fmt, ...)
@@ -187,26 +189,37 @@ spawn_on_console(const char *dir, const char *path, char *const argv[], int ofla
 }
 
 static void
-start_shell(void)
+start_console(void)
 {
-	char *argv[] = { "-sh", NULL };
+	char *getty_argv[] = { "getty", "default", "-", NULL };
+	char *shell_argv[] = { "-sh", NULL };
+	const char *path = GETTY;
+	char **argv = getty_argv;
+	if (access(GETTY, X_OK) != 0 || access(LOGIN, X_OK) != 0) {
+		path = SHELL;
+		argv = shell_argv;
+		say("getty or login unavailable; starting a root shell");
+	}
 	/*
+	 * Getty's "-" uses the console descriptors and controlling terminal
+	 * set up by spawn_on_console(). The default entry keeps its speed.
+	 *
 	 * O_POPUP: the screen of a boot without -v (pieboot's pie, the
 	 * kernel's progress bar), which /etc/rc ran behind, turns into the
-	 * text console for the shell.
+	 * text console for login or the fallback shell.
 	 */
-	shell_pid = spawn_on_console(ROOT_HOME, SHELL, argv, O_POPUP);
-	if (shell_pid < 0) {
-		shell_pid = 0;
+	console_pid = spawn_on_console(ROOT_HOME, path, argv, O_POPUP);
+	if (console_pid < 0) {
+		console_pid = 0;
 	}
 }
 
-/* Start a new console shell in a second (it may keep exiting at once). */
+/* Start a new console process in a second (it may keep exiting at once). */
 static void
-restart_shell_later(void)
+restart_console_later(void)
 {
 	struct kevent ev;
-	EV_SET(&ev, TIMER_SHELL, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_SECONDS, 1, NULL);
+	EV_SET(&ev, TIMER_CONSOLE, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_SECONDS, 1, NULL);
 	kevent(kq, &ev, 1, NULL, 0, NULL);
 }
 
@@ -223,13 +236,13 @@ reap(void)
 				    WIFEXITED(status) ? WEXITSTATUS(status) : -1);
 			}
 			if (shutdown_how < 0) {
-				start_shell();
+				start_console();
 			}
-		} else if (pid == shell_pid) {
-			shell_pid = 0;
+		} else if (pid == console_pid) {
+			console_pid = 0;
 			if (shutdown_how < 0) {
-				say("console shell exited; starting a new one");
-				restart_shell_later();
+				say("console process exited; starting a new one");
+				restart_console_later();
 			}
 		}
 	}
@@ -623,14 +636,14 @@ main(void)
 	umask(022);
 	bs_setup();
 
-	/* /etc/rc runs while init serves the bootstrap port; then the shell. */
+	/* /etc/rc runs while init serves the bootstrap port; then the console login. */
 	if (access(RC, R_OK) == 0) {
 		char *argv[] = { "sh", RC, "autoboot", NULL };
 		rc_pid = spawn_on_console("/", SHELL, argv, 0);
 	}
 	if (rc_pid <= 0) {
 		rc_pid = 0;
-		start_shell();
+		start_console();
 	}
 
 	while (shutdown_how < 0) {
@@ -653,8 +666,8 @@ main(void)
 				}
 				break;
 			case EVFILT_TIMER:
-				if (out[i].ident == TIMER_SHELL && shell_pid == 0) {
-					start_shell();
+				if (out[i].ident == TIMER_CONSOLE && console_pid == 0) {
+					start_console();
 				}
 				break;
 			}

@@ -1,3 +1,9 @@
+init (2) blueberry-pie-os; urgency=medium
+
+  * Start getty on the console in place of a root shell.
+
+ -- Maxwell <maxwell@blueberrypieos.com>  Tue, 10 Nov 2026 00:35:22 +0000
+
 init (1) blueberry-pie-os; urgency=medium
 
   * init 1
