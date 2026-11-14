@@ -20,7 +20,8 @@
  *     run time do not pile up;
  *   - makes the ports of the host port names at boot and sets them as the
  *     host's special ports, as launchd's HostSpecialPort does: auditd
- *     checks in com.apple.auditd, the kernel's audit control port;
+ *     checks in com.apple.auditd, the kernel's audit control port, and
+ *     kextd com.blueberrypieos.kextd, the port the kernel asks for kexts on;
  *   - runs /etc/rc (with /bin/sh), then keeps getty on the console,
  *     starting a new one when it exits, or a root shell without login;
  *     once /etc/rc exits, runs ROOT_SETUP rc STATUS boot|softboot;
@@ -387,6 +388,7 @@ static const struct {
 	int id;
 } host_ports[] = {
 	{ "com.apple.auditd", HOST_AUDIT_CONTROL_PORT },
+	{ "com.blueberrypieos.kextd", HOST_KEXTD_PORT },
 };
 
 struct service {

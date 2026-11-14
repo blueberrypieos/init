@@ -1,3 +1,10 @@
+init (6) blueberry-pie-os; urgency=medium
+
+  * init makes the kernel's kext port, HOST_KEXTD_PORT, for kextd to check
+    in as com.blueberrypieos.kextd.
+
+ -- Maxwell <maxwell@blueberrypieos.com>  Wed, 18 Nov 2026 23:58:54 +0000
+
 init (5) blueberry-pie-os; urgency=medium
 
   * Build-Depend on pietoolchain-host and pietoolchain-sdk.
