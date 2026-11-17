@@ -1,3 +1,18 @@
+init (5) blueberry-pie-os; urgency=medium
+
+  * Build-Depend on pietoolchain-host and pietoolchain-sdk.
+  * A ZFS root is remounted read-write unless its readonly property is on.
+  * init runs /usr/libexec/pie-root-setup, if it is installed, before
+    /etc/rc and again once /etc/rc exits.
+  * A soft reboot, reboot3() with RB2_USERREBOOT, restarts user space: init
+    stops every process, unmounts every file system but the root and /dev,
+    switches the root to the ZFS dataset named in /var/run/pie-softreboot
+    with pivot_root(2), and runs itself again. It reboots instead if a
+    process outlives SIGKILL or a step fails. A failed pie-root-setup makes
+    the boot count as failed.
+
+ -- Maxwell <maxwell@blueberrypieos.com>  Mon, 16 Nov 2026 20:15:26 +0000
+
 init (3) blueberry-pie-os; urgency=medium
 
   * Before a reboot or halt, init runs /etc/rc.shutdown, for 30 seconds at

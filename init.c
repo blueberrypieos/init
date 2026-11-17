@@ -6,7 +6,10 @@
  * xnu starts). It is a small classic init that is also the bootstrap server:
  *
  *   - puts the console on standard input, output and error;
- *   - remounts the root filesystem read-write;
+ *   - remounts the root filesystem read-write, unless it is a ZFS dataset
+ *     whose readonly property is on (a sealed root);
+ *   - runs ROOT_SETUP boot (ROOT_SETUP softboot after a soft reboot), if
+ *     it is installed, and waits for it before /etc/rc;
  *   - serves the task bootstrap port that every process inherits: services
  *     check in, look up and register by name, and root can ask for a
  *     reboot or halt (the protocol of <pie/bootstrap.h>, which libxpc's
@@ -20,9 +23,16 @@
  *     checks in com.apple.auditd, the kernel's audit control port;
  *   - runs /etc/rc (with /bin/sh), then keeps getty on the console,
  *     starting a new one when it exits, or a root shell without login;
+ *     once /etc/rc exits, runs ROOT_SETUP rc STATUS boot|softboot;
  *   - on a reboot or halt, runs /etc/rc.shutdown (with /bin/sh) while it
  *     still serves the bootstrap port, for RC_SHUTDOWN_WAIT seconds at
  *     most, then stops every process;
+ *   - on a soft reboot (reboot3() with RB2_USERREBOOT), runs
+ *     /etc/rc.shutdown softreboot, stops every process, unmounts every
+ *     file system but the root and /dev, switches the root to the ZFS
+ *     dataset named in SOFTREBOOT_TARGET, if any, with pivot_root(2), and
+ *     runs itself again as /sbin/launchd -softboot; if that fails, it
+ *     reboots;
  *   - reaps every orphaned process.
  *
  * xnu lets no process signal init, so reboot(8) and shutdown(8) ask it
@@ -47,8 +57,11 @@
 #include <sys/event.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
+#include <sys/proc.h>
 #include <sys/reboot.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/sysctl.h>
 #include <sys/vnode.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -64,9 +77,28 @@
 #define CONSOLE          _PATH_CONSOLE
 #define ROOT_HOME        "/var/root"
 #define PATH             "/usr/bin:/bin:/usr/sbin:/sbin"
+#define ROOT_SETUP       "/usr/libexec/pie-root-setup"
+#define SOFTREBOOT_TARGET "/var/run/pie-softreboot"
+#define NEXT_ROOT        "/System/Volumes/Next"
+#define PREVIOUS_ROOT    "System/Volumes/Previous"
+#define SELF             "/sbin/launchd"
+#define RB2_USERREBOOT   0x2000000000000000ULL
+
+struct zfs_mount_args {
+	const char *fspec;
+	int mflag;
+	const char *optptr;
+	int optlen;
+	int struct_size;
+};
+
+int pivot_root(const char *new_rootfs_path_before, const char *old_rootfs_path_after);
 
 static int shutdown_how = -1;         /* RB_* once a reboot or halt is asked for */
-static pid_t rc_pid, console_pid, rc_shutdown_pid;
+static bool soft_reboot;                /* the reboot asked for restarts user space only */
+static bool softboot;                   /* started by a soft reboot */
+static bool setup_failed;               /* ROOT_SETUP exited nonzero */
+static pid_t setup_pid, rc_pid, console_pid, rc_shutdown_pid;
 static mach_port_t bs_port;
 static mach_port_t bs_notify;           /* dead-name notifications; no one else can send here */
 static int kq;
@@ -142,6 +174,13 @@ remount_root(void)
 		args.hfs_timezone.tz_dsttime = VNOVAL;
 		args.flags = VNOVAL;
 		r = mount(sfs.f_fstypename, "/", (int)(sfs.f_flags & ~MNT_RDONLY) | MNT_UPDATE, &args);
+	} else if (strcmp(sfs.f_fstypename, "zfs") == 0) {
+		struct zfs_mount_args args = { sfs.f_mntfromname, 0, NULL, 0, sizeof(args) };
+		r = mount(sfs.f_fstypename, "/", (int)(sfs.f_flags & ~MNT_RDONLY) | MNT_UPDATE, &args);
+		if (r != 0 && errno == EROFS) {
+			say("the root %s is sealed: it stays read-only", sfs.f_mntfromname);
+			return;
+		}
 	} else {
 		r = mount(sfs.f_fstypename, "/", (int)(sfs.f_flags & ~MNT_RDONLY) | MNT_UPDATE, NULL);
 	}
@@ -200,6 +239,45 @@ spawn_on_console(const char *dir, const char *path, char *const argv[], int ofla
 }
 
 static void restart_console_later(void);
+static void start_console(void);
+
+static void
+start_rc(void)
+{
+	if (access(RC, R_OK) == 0) {
+		char *argv[] = { "sh", RC, "autoboot", NULL };
+		rc_pid = spawn_on_console("/", SHELL, argv, 0);
+	}
+	if (rc_pid <= 0) {
+		rc_pid = 0;
+		start_console();
+	}
+}
+
+static void
+start_setup(void)
+{
+	if (access(ROOT_SETUP, X_OK) == 0) {
+		char *argv[] = { "pie-root-setup", softboot ? "softboot" : "boot", NULL };
+		setup_pid = spawn_on_console("/", ROOT_SETUP, argv, 0);
+	}
+	if (setup_pid <= 0) {
+		setup_pid = 0;
+		start_rc();
+	}
+}
+
+static void
+rc_done(int status)
+{
+	char code[16];
+	char *argv[] = { "pie-root-setup", "rc", code, softboot ? "softboot" : "boot", NULL };
+	if (access(ROOT_SETUP, X_OK) != 0) {
+		return;
+	}
+	snprintf(code, sizeof(code), "%d", setup_failed ? 1 : WIFEXITED(status) ? WEXITSTATUS(status) : 128);
+	spawn_on_console("/", ROOT_SETUP, argv, 0);
+}
 
 static void
 start_console(void)
@@ -243,7 +321,17 @@ reap(void)
 	int status;
 	pid_t pid;
 	while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-		if (pid == rc_pid) {
+		if (pid == setup_pid) {
+			setup_pid = 0;
+			if (status != 0) {
+				setup_failed = true;
+				say("%s exited with status %d", ROOT_SETUP,
+				    WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+			}
+			if (shutdown_how < 0) {
+				start_rc();
+			}
+		} else if (pid == rc_pid) {
 			rc_pid = 0;
 			if (status != 0) {
 				say("%s exited with status %d", RC,
@@ -251,6 +339,7 @@ reap(void)
 			}
 			if (shutdown_how < 0) {
 				start_console();
+				rc_done(status);
 			}
 		} else if (pid == rc_shutdown_pid) {
 			rc_shutdown_pid = 0;
@@ -621,6 +710,7 @@ bs_handle(pie_bs_request_buffer_t *in)
 			rep.ret = BOOTSTRAP_NOT_PRIVILEGED;
 		} else if (shutdown_how < 0) {
 			shutdown_how = (req->arg & RB_HALT) ? RB_HALT : RB_AUTOBOOT;
+			soft_reboot = shutdown_how == RB_AUTOBOOT && (req->arg & RB2_USERREBOOT) != 0;
 		}
 		break;
 	default:
@@ -681,7 +771,8 @@ start_rc_shutdown(void)
 	if (access(RC_SHUTDOWN, R_OK) != 0) {
 		return;
 	}
-	char *argv[] = { "sh", RC_SHUTDOWN, shutdown_how == RB_HALT ? "halt" : "reboot", NULL };
+	char *argv[] = { "sh", RC_SHUTDOWN,
+		shutdown_how == RB_HALT ? "halt" : soft_reboot ? "softreboot" : "reboot", NULL };
 	pid_t pid = spawn_on_console("/", SHELL, argv, 0);
 	if (pid <= 0) {
 		return;
@@ -695,24 +786,139 @@ start_rc_shutdown(void)
 	rc_shutdown_pid = pid;
 }
 
-static void
-shutdown_system(void)
+static int
+live_processes(bool report)
 {
-	say("%s", shutdown_how == RB_HALT ? "halting" : "rebooting");
+	int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
+	size_t len = 0;
+	if (sysctl(mib, 3, NULL, &len, NULL, 0) != 0) {
+		return -1;
+	}
+	len += 16 * sizeof(struct kinfo_proc);
+	struct kinfo_proc *kp = malloc(len);
+	if (kp == NULL || sysctl(mib, 3, kp, &len, NULL, 0) != 0) {
+		free(kp);
+		return -1;
+	}
+	int n = 0;
+	for (size_t i = 0; i < len / sizeof(*kp); i++) {
+		struct extern_proc *p = &kp[i].kp_proc;
+		if (p->p_pid <= 1 || p->p_stat == SZOMB || (p->p_flag & P_SYSTEM) != 0) {
+			continue;
+		}
+		n++;
+		if (report) {
+			say("process %d (%s) outlived SIGKILL", p->p_pid, p->p_comm);
+		}
+	}
+	free(kp);
+	return n;
+}
+
+static bool
+stop_processes(void)
+{
 	kill(-1, SIGTERM);
 	/* Two seconds for everything to quit, then SIGKILL. */
 	for (int i = 0; i < 20; i++) {
 		while (waitpid(-1, NULL, WNOHANG) > 0) {
 		}
-		if (kill(-1, 0) != 0 && errno == ESRCH) {
+		if (live_processes(false) == 0) {
 			break;
 		}
 		usleep(100000);
 	}
 	kill(-1, SIGKILL);
-	while (waitpid(-1, NULL, WNOHANG) > 0) {
+	int left = -1;
+	for (int i = 0; i < 50 && left != 0; i++) {
+		while (waitpid(-1, NULL, WNOHANG) > 0) {
+		}
+		left = live_processes(false);
+		if (left != 0) {
+			usleep(100000);
+		}
+	}
+	if (left != 0) {
+		live_processes(true);
 	}
 	sync();
+	return left == 0;
+}
+
+static bool
+unmount_all(void)
+{
+	struct statfs *m;
+	int n = getmntinfo(&m, MNT_NOWAIT);
+	bool ok = true;
+	if (n <= 0) {
+		return false;
+	}
+	for (int i = n - 1; i >= 0; i--) {
+		if (strcmp(m[i].f_mntonname, "/") == 0 || strcmp(m[i].f_fstypename, "devfs") == 0) {
+			continue;
+		}
+		if (unmount(m[i].f_mntonname, 0) != 0 && unmount(m[i].f_mntonname, MNT_FORCE) != 0) {
+			say("cannot unmount %s: %s", m[i].f_mntonname, strerror(errno));
+			ok = false;
+		}
+	}
+	return ok;
+}
+
+static void
+soft_restart(void)
+{
+	char target[MAXPATHLEN] = "";
+	FILE *f = fopen(SOFTREBOOT_TARGET, "r");
+	if (f != NULL) {
+		if (fgets(target, sizeof(target), f) == NULL) {
+			target[0] = '\0';
+		}
+		target[strcspn(target, "\n")] = '\0';
+		fclose(f);
+		unlink(SOFTREBOOT_TARGET);
+	}
+	say("restarting user space%s%s", target[0] != '\0' ? " on " : "", target);
+	if (!stop_processes()) {
+		return;
+	}
+	if (!unmount_all()) {
+		return;
+	}
+	struct statfs root;
+	if (target[0] != '\0' && (statfs("/", &root) != 0 || strcmp(root.f_mntfromname, target) != 0)) {
+		struct zfs_mount_args args = { target, 0, NULL, 0, sizeof(args) };
+		if (mount("zfs", NEXT_ROOT, MNT_RDONLY, &args) != 0) {
+			say("cannot mount %s on %s: %s", target, NEXT_ROOT, strerror(errno));
+			return;
+		}
+		if (pivot_root(NEXT_ROOT, PREVIOUS_ROOT) != 0) {
+			say("cannot switch the root to %s: %s", target, strerror(errno));
+			unmount(NEXT_ROOT, 0);
+			return;
+		}
+	}
+	chdir("/");
+	if (usrctl(0) != 0) {
+		say("usrctl: %s", strerror(errno));
+		return;
+	}
+	char *argv[] = { "launchd", "-softboot", NULL };
+	execv(SELF, argv);
+	say("cannot run %s: %s", SELF, strerror(errno));
+}
+
+static void
+shutdown_system(void)
+{
+	open_console();
+	if (soft_reboot) {
+		soft_restart();
+		shutdown_how = RB_AUTOBOOT;
+	}
+	say("%s", shutdown_how == RB_HALT ? "halting" : "rebooting");
+	stop_processes();
 	reboot(shutdown_how);
 	say("reboot: %s", strerror(errno));
 	for (;;) {
@@ -721,12 +927,13 @@ shutdown_system(void)
 }
 
 int
-main(void)
+main(int argc, char *argv[])
 {
 	if (getpid() != 1) {
 		fprintf(stderr, "init: must be process 1\n");
 		return 1;
 	}
+	softboot = argc > 1 && strcmp(argv[1], "-softboot") == 0;
 	open_console();
 	setsid();
 
@@ -735,6 +942,7 @@ main(void)
 	 * are ignored, except SIGCHLD, which keeps its default action.
 	 */
 	kq = kqueue();
+	fcntl(kq, F_SETFD, FD_CLOEXEC);
 	int ignored[] = { SIGTERM, SIGUSR2, SIGHUP, SIGINT, SIGTSTP, SIGTTIN, SIGTTOU };
 	for (size_t i = 0; i < sizeof(ignored) / sizeof(ignored[0]); i++) {
 		signal(ignored[i], SIG_IGN);
@@ -745,22 +953,18 @@ main(void)
 	EV_SET(&ev[2], SIGUSR2, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
 	kevent(kq, ev, 3, NULL, 0, NULL);
 
-	say("Blueberry Pie OS init starting");
+	say("Blueberry Pie OS init starting%s", softboot ? " after a soft reboot" : "");
+	if (softboot && unmount("/" PREVIOUS_ROOT, 0) != 0 && errno != EINVAL && errno != ENOENT) {
+		say("cannot unmount /%s: %s", PREVIOUS_ROOT, strerror(errno));
+	}
 	remount_root();
 	setup_environment();
 	chdir("/");
 	umask(022);
 	bs_setup();
 
-	/* /etc/rc runs while init serves the bootstrap port; then the console login. */
-	if (access(RC, R_OK) == 0) {
-		char *argv[] = { "sh", RC, "autoboot", NULL };
-		rc_pid = spawn_on_console("/", SHELL, argv, 0);
-	}
-	if (rc_pid <= 0) {
-		rc_pid = 0;
-		start_console();
-	}
+	/* The root setup, then /etc/rc, run while init serves the bootstrap port; then the console login. */
+	start_setup();
 
 	/* Once a reboot or halt is asked for, serve on until /etc/rc.shutdown is done. */
 	bool stopping = false;
