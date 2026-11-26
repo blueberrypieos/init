@@ -1,3 +1,10 @@
+init (7) blueberry-pie-os; urgency=medium
+
+  * Only root may serve a name that starts with com.blueberrypieos.system.,
+    as with com.apple.system.
+
+ -- Maxwell <maxwell@blueberrypieos.com>  Thu, 26 Nov 2026 08:49:24 +0000
+
 init (6) blueberry-pie-os; urgency=medium
 
   * init makes the kernel's kext port, HOST_KEXTD_PORT, for kextd to check

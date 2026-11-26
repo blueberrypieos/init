@@ -14,10 +14,10 @@
  *     check in, look up and register by name, and root can ask for a
  *     reboot or halt (the protocol of <pie/bootstrap.h>, which libxpc's
  *     bootstrap_* calls and reboot3() speak); only root may serve a
- *     system name, one that starts with SYSTEM_PREFIX, or a host port
- *     name; a name is forgotten once its service's port dies (its owner
- *     exited), so that it can be checked in again and names made up at
- *     run time do not pile up;
+ *     system name, one that starts with SYSTEM_PREFIX or PIE_SYSTEM_PREFIX,
+ *     or a host port name; a name is forgotten once its service's port
+ *     dies, so that it can be checked in again and names made up at run
+ *     time do not pile up;
  *   - makes the ports of the host port names at boot and sets them as the
  *     host's special ports, as launchd's HostSpecialPort does: auditd
  *     checks in com.apple.auditd, the kernel's audit control port, and
@@ -373,6 +373,7 @@ reap(void)
  * token has euid 0 may check one in or register one.
  */
 #define SYSTEM_PREFIX "com.apple.system."
+#define PIE_SYSTEM_PREFIX "com.blueberrypieos.system."
 
 /*
  * Names whose port is also a host special port. Only the kernel and init may
@@ -413,7 +414,8 @@ host_port_id(const char *name)
 static bool
 privileged_name(const char *name)
 {
-	return strncmp(name, SYSTEM_PREFIX, sizeof(SYSTEM_PREFIX) - 1) == 0 || host_port_id(name) != 0;
+	return strncmp(name, SYSTEM_PREFIX, sizeof(SYSTEM_PREFIX) - 1) == 0 ||
+	       strncmp(name, PIE_SYSTEM_PREFIX, sizeof(PIE_SYSTEM_PREFIX) - 1) == 0 || host_port_id(name) != 0;
 }
 
 static struct service *
